@@ -1,8 +1,8 @@
 import { chmod, readFile, writeFile, mkdir, access } from "node:fs/promises";
+import { unlinkSync, constants } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { execSync } from "node:child_process";
-import { constants } from "node:fs";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 // --- Constants ---
@@ -220,7 +220,7 @@ function getServiceStatus(): string {
 function removeServiceFile(): boolean {
 	const servicePath = join(SYSTEMD_USER_DIR, `${SERVICE_NAME}.service`);
 	try {
-		require("node:fs").unlinkSync(servicePath);
+		unlinkSync(servicePath);
 		return true;
 	} catch {
 		return false;
@@ -403,7 +403,7 @@ function generateWrapperScript(config: WatchdogConfig): string {
 		"",
 		"while true; do",
 		'    echo "[pi-watchdog] Starting pi at $(date -u +%Y-%m-%dT%H:%M:%SZ) ..."',
-		"    " + piCmd + " " + piArgs,
+		"    " + shellEscape(piCmd) + " " + piArgs,
 		"    EXIT_CODE=$?",
 		"    NOW=$(date +%s)",
 		'    echo "[pi-watchdog] pi exited with code $EXIT_CODE at $(date -u +%Y-%m-%dT%H:%M:%SZ)"',
@@ -428,6 +428,12 @@ function systemdEscape(val: string): string {
 	return val.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
+/** Quote a value for systemd command-line arguments. Wraps in double quotes if needed. */
+function systemdQuote(val: string): string {
+	if (/^[a-zA-Z0-9_./:=@+~-]+$/.test(val)) return val;
+	return '"' + systemdEscape(val) + '"';
+}
+
 function generateServiceUnit(config: WatchdogConfig): string {
 	const tmuxBinary = getTmuxBinary();
 	const session = config.tmuxSession;
@@ -441,8 +447,8 @@ function generateServiceUnit(config: WatchdogConfig): string {
 		"[Service]",
 		"Type=oneshot",
 		'Environment="HOME=' + systemdEscape(homedir()) + '"',
-		"ExecStart=" + tmuxBinary + " new-session -d -s " + session + " " + WRAPPER_SCRIPT_PATH,
-		"ExecStop=" + tmuxBinary + " kill-session -t " + session,
+		"ExecStart=" + systemdQuote(tmuxBinary) + " new-session -d -s " + systemdQuote(session) + " " + systemdQuote(WRAPPER_SCRIPT_PATH),
+		"ExecStop=" + systemdQuote(tmuxBinary) + " kill-session -t " + systemdQuote(session),
 		"RemainAfterExit=yes",
 		"StandardOutput=journal",
 		"StandardError=journal",
@@ -463,12 +469,18 @@ async function enableWatchdog(config: WatchdogConfig): Promise<EnableResult> {
 	config.enabled = true;
 	const adopted = adoptCurrentTmuxSession(config.tmuxSession);
 
-	await writeConfig(config);
-	const servicePath = await regenerateServiceFiles(config);
-	const linger = runShell("loginctl enable-linger");
-	runShell(`systemctl --user enable ${SERVICE_NAME}.service`);
-
-	return { servicePath, adopted, linger };
+	try {
+		await writeConfig(config);
+		const servicePath = await regenerateServiceFiles(config);
+		const linger = runShell("loginctl enable-linger");
+		runShell(`systemctl --user enable ${SERVICE_NAME}.service`);
+		return { servicePath, adopted, linger };
+	} catch (e) {
+		// Roll back config on partial failure
+		config.enabled = false;
+		try { await writeConfig(config); } catch {}
+		throw e;
+	}
 }
 
 // --- Instance detection ---
