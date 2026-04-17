@@ -1,0 +1,14 @@
+{
+  "name": "pi-mono-watchdog",
+  "version": "1.0.0",
+  "description": "tmux-based watchdog extension for pi coding agent with auto-restart, telegram integration, and systemd service management",
+  "license": "MIT",
+  "author": "Roy Osherove",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/inceptionstack/pi-mono-watchdog.git"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
