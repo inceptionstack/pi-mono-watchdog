@@ -446,6 +446,19 @@ function isWatchdogInstance(config: WatchdogConfig): boolean {
 	return getCurrentTmuxSession() === config.tmuxSession;
 }
 
+/** Rename the current tmux session if we're inside one with a different name. */
+function adoptCurrentTmuxSession(targetName: string): { adopted: boolean; oldName?: string } {
+	const current = getCurrentTmuxSession();
+	if (!current || current === targetName) return { adopted: false };
+
+	// Don't rename if target session already exists (would collide)
+	if (isTmuxSessionRunning(targetName)) return { adopted: false };
+
+	const { ok } = runShell(`tmux rename-session -t ${shellEscape(current)} ${shellEscape(targetName)}`);
+	if (ok) return { adopted: true, oldName: current };
+	return { adopted: false };
+}
+
 // --- Extension entry point ---
 
 export default function (pi: ExtensionAPI) {
@@ -549,6 +562,9 @@ export default function (pi: ExtensionAPI) {
 
 			config.enabled = true;
 
+			// If we're inside a tmux session with a different name, rename it
+			const adopt = adoptCurrentTmuxSession(config.tmuxSession);
+
 			try {
 				await writeConfig(config);
 				const servicePath = await regenerateServiceFiles(config);
@@ -561,6 +577,7 @@ export default function (pi: ExtensionAPI) {
 					[
 						"🐕 pi-watchdog enabled!",
 						"",
+						...(adopt.adopted ? [`  Renamed tmux session '${adopt.oldName}' \u2192 '${session}'`] : []),
 						`  Wrapper script: ${WRAPPER_SCRIPT_PATH}`,
 						`  Service file:   ${servicePath}`,
 						`  tmux session:   ${session}`,
