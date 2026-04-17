@@ -130,13 +130,13 @@ function delay(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms));
 }
 
-/** Ensure XDG_RUNTIME_DIR is set — needed for systemctl --user in tmux sessions. */
+/** Ensure XDG_RUNTIME_DIR matches the current user — needed for systemctl --user in tmux sessions. */
 function ensureXdgRuntime(): void {
-	if (!process.env.XDG_RUNTIME_DIR) {
-		const uid = process.getuid?.();
-		if (uid !== undefined) {
-			process.env.XDG_RUNTIME_DIR = `/run/user/${uid}`;
-		}
+	const uid = process.getuid?.();
+	if (uid === undefined) return;
+	const expected = `/run/user/${uid}`;
+	if (process.env.XDG_RUNTIME_DIR !== expected) {
+		process.env.XDG_RUNTIME_DIR = expected;
 	}
 }
 
