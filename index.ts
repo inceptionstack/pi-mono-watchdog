@@ -404,14 +404,49 @@ WantedBy=default.target
 `;
 }
 
+// --- Instance detection ---
+
+/** Returns the tmux session name this process is running in, or null if not in tmux. */
+function getCurrentTmuxSession(): string | null {
+	if (!process.env.TMUX) return null;
+	try {
+		return execSync("tmux display-message -p '#S'", { encoding: "utf8", timeout: EXEC_TIMEOUT_MS }).trim() || null;
+	} catch {
+		return null;
+	}
+}
+
+/** Check if this pi instance is the watchdog-managed one (running inside the watchdog tmux session). */
+function isWatchdogInstance(config: WatchdogConfig): boolean {
+	return getCurrentTmuxSession() === config.tmuxSession;
+}
+
 // --- Extension entry point ---
 
 export default function (pi: ExtensionAPI) {
-	pi.on("session_start", async (event) => {
+	pi.on("session_start", async (event, ctx) => {
 		if (event.reason !== "startup") return;
 
 		const config = await readConfig();
-		if (!config.enabled || !config.autoTelegram) return;
+		if (!config.enabled) return;
+
+		// Detect dual-instance: another pi is already running in the watchdog tmux session
+		if (!isWatchdogInstance(config) && isTmuxSessionRunning(config.tmuxSession)) {
+			ctx.ui.notify(
+				[
+					"⚠️  pi-watchdog: another pi instance is already running in the watchdog tmux session.",
+					`  Attach with: ${attachHint(config.tmuxSession)}`,
+					"",
+					"  Telegram auto-connect skipped to avoid conflicts.",
+					"  Use /watchdog-stop first if you want to take over.",
+				].join("\n"),
+				"warning"
+			);
+			return;
+		}
+
+		// This is the watchdog instance (or no other instance is running) — auto-connect telegram
+		if (!config.autoTelegram) return;
 		if (!(await readTelegramConfig())) return;
 
 		await sendTelegramNotification(`🐕 pi-watchdog: pi started at ${new Date().toISOString()}`);
