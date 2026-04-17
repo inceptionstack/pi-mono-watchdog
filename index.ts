@@ -105,7 +105,10 @@ async function sendTelegramNotification(message: string): Promise<boolean> {
 				text: message,
 			}),
 		});
-		const data = (await res.json()) as { ok: boolean };
+		const data = (await res.json()) as { ok: boolean; description?: string };
+		if (!data.ok) {
+			console.error(`[pi-watchdog] Telegram API error: ${data.description ?? "unknown"}`);
+		}
 		return data.ok;
 	} catch (e) {
 		console.error("[pi-watchdog] Telegram notification failed:", e);
@@ -168,16 +171,6 @@ function whichBinary(name: string, fallbacks: string[] = []): string | null {
 	}
 }
 
-function getPiBinary(): string {
-	const bin = whichBinary("pi", [
-		join(homedir(), ".local", "bin", "pi"),
-		join(homedir(), ".local", "share", "mise", "installs", "node", "latest", "bin", "pi"),
-		"/usr/local/bin/pi",
-	]);
-	if (!bin) throw new Error("Could not find pi binary. Ensure pi is in PATH.");
-	return bin;
-}
-
 function getTmuxBinary(): string {
 	return whichBinary("tmux") ?? "tmux";
 }
@@ -224,13 +217,26 @@ function getServiceStatus(): string {
 	return runShell(`systemctl --user status ${SERVICE_NAME}.service 2>&1`).output;
 }
 
+function removeServiceFile(): boolean {
+	const servicePath = join(SYSTEMD_USER_DIR, `${SERVICE_NAME}.service`);
+	try {
+		require("node:fs").unlinkSync(servicePath);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function disableService(): string[] {
 	const warnings: string[] = [];
-	const stop = systemctl("stop");
+	if (isServiceRunning()) {
+		const stop = systemctl("stop");
+		if (!stop.ok) warnings.push(`  ⚠️  stop: ${stop.output}`);
+	}
 	const disable = systemctl("disable");
-	runShell("systemctl --user daemon-reload");
-	if (!stop.ok) warnings.push(`  ⚠️  stop: ${stop.output}`);
 	if (!disable.ok) warnings.push(`  ⚠️  disable: ${disable.output}`);
+	if (!removeServiceFile()) warnings.push("  ⚠️  could not remove service file");
+	runShell("systemctl --user daemon-reload");
 	return warnings;
 }
 
@@ -381,7 +387,7 @@ function generateWrapperScript(config: WatchdogConfig): string {
 		"",
 		"    # Prune crash timestamps older than the window",
 		"    PRUNED=()",
-		"    if (( ${#CRASH_TIMES[@]} > 0 )); then",
+		'    if [ ${#CRASH_TIMES[@]} -gt 0 ]; then',
 		'        for T in "${CRASH_TIMES[@]}"; do',
 		"            if (( NOW - T < " + RAPID_CRASH_WINDOW_SEC + " )); then",
 		'                PRUNED+=("$T")',
@@ -389,7 +395,7 @@ function generateWrapperScript(config: WatchdogConfig): string {
 		"        done",
 		"    fi",
 		"    CRASH_TIMES=()",
-		"    if (( ${#PRUNED[@]} > 0 )); then",
+		'    if [ ${#PRUNED[@]} -gt 0 ]; then',
 		'        CRASH_TIMES=("${PRUNED[@]}")',
 		"    fi",
 		"",
@@ -562,13 +568,6 @@ export default function (pi: ExtensionAPI) {
 
 			if (config.enabled && isServiceInstalled()) {
 				if (!(await ctx.ui.confirm("Already enabled", "Watchdog is already enabled. Regenerate files?"))) return;
-			}
-
-			try {
-				getPiBinary();
-			} catch (e: any) {
-				ctx.ui.notify(`❌ ${e.message}`, "error");
-				return;
 			}
 
 			config.enabled = true;
@@ -756,7 +755,7 @@ export default function (pi: ExtensionAPI) {
 			if (config.enabled) {
 				try {
 					await regenerateServiceFiles(config);
-					ctx.ui.notify("  (service + wrapper regenerated)", "info");
+					ctx.ui.notify("  (service + wrapper regenerated. Restart watchdog to apply.)", "info");
 				} catch (e: any) {
 					ctx.ui.notify(`  ⚠️  Failed to regenerate: ${e.message}`, "warning");
 				}
