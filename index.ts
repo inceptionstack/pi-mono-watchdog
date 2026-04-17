@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { execSync } from "node:child_process";
 import { constants } from "node:fs";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 // --- Constants ---
 
@@ -102,6 +102,20 @@ async function sendTelegramNotification(message: string): Promise<boolean> {
 	}
 }
 
+// --- Formatting helpers ---
+
+function check(val: boolean, trueText = "✅", falseText = "❌"): string {
+	return val ? trueText : falseText;
+}
+
+function attachHint(session: string): string {
+	return `tmux attach -t ${session}`;
+}
+
+function delay(ms: number): Promise<void> {
+	return new Promise((r) => setTimeout(r, ms));
+}
+
 // --- Shell utilities ---
 
 function shellEscape(arg: string): string {
@@ -119,31 +133,32 @@ function runShell(cmd: string): { ok: boolean; output: string } {
 	}
 }
 
-function getPiBinary(): string {
+function whichBinary(name: string, fallbacks: string[] = []): string | null {
 	try {
-		return execSync("which pi", { encoding: "utf8", timeout: EXEC_TIMEOUT_MS }).trim();
+		return execSync(`which ${name}`, { encoding: "utf8", timeout: EXEC_TIMEOUT_MS }).trim();
 	} catch {
-		const candidates = [
-			join(homedir(), ".local", "bin", "pi"),
-			join(homedir(), ".local", "share", "mise", "installs", "node", "latest", "bin", "pi"),
-			"/usr/local/bin/pi",
-		];
-		for (const c of candidates) {
+		for (const c of fallbacks) {
 			try {
 				execSync(`test -x ${shellEscape(c)}`, { timeout: EXEC_TIMEOUT_MS });
 				return c;
 			} catch {}
 		}
-		throw new Error("Could not find pi binary. Ensure pi is in PATH.");
+		return null;
 	}
 }
 
+function getPiBinary(): string {
+	const bin = whichBinary("pi", [
+		join(homedir(), ".local", "bin", "pi"),
+		join(homedir(), ".local", "share", "mise", "installs", "node", "latest", "bin", "pi"),
+		"/usr/local/bin/pi",
+	]);
+	if (!bin) throw new Error("Could not find pi binary. Ensure pi is in PATH.");
+	return bin;
+}
+
 function getTmuxBinary(): string {
-	try {
-		return execSync("which tmux", { encoding: "utf8", timeout: EXEC_TIMEOUT_MS }).trim();
-	} catch {
-		return "tmux";
-	}
+	return whichBinary("tmux") ?? "tmux";
 }
 
 function getMiseShimPath(): string {
@@ -153,21 +168,11 @@ function getMiseShimPath(): string {
 // --- tmux helpers ---
 
 function isTmuxInstalled(): boolean {
-	try {
-		execSync("which tmux", { encoding: "utf8", timeout: EXEC_TIMEOUT_MS });
-		return true;
-	} catch {
-		return false;
-	}
+	return whichBinary("tmux") !== null;
 }
 
 function isTmuxSessionRunning(session: string): boolean {
-	try {
-		execSync(`tmux has-session -t ${shellEscape(session)} 2>/dev/null`, { timeout: EXEC_TIMEOUT_MS });
-		return true;
-	} catch {
-		return false;
-	}
+	return runShell(`tmux has-session -t ${shellEscape(session)} 2>/dev/null`).ok;
 }
 
 function killTmuxSession(session: string): void {
@@ -178,44 +183,71 @@ function killTmuxSession(session: string): void {
 
 // --- systemd helpers ---
 
+function systemctl(action: string): { ok: boolean; output: string } {
+	return runShell(`systemctl --user ${action} ${SERVICE_NAME}.service 2>/dev/null`);
+}
+
 function isServiceInstalled(): boolean {
 	return runShell(`systemctl --user cat ${SERVICE_NAME}.service 2>/dev/null`).ok;
 }
 
 function isServiceRunning(): boolean {
-	return runShell(`systemctl --user is-active ${SERVICE_NAME}.service 2>/dev/null`).output === "active";
+	return systemctl("is-active").output === "active";
 }
 
 function isServiceEnabled(): boolean {
-	return runShell(`systemctl --user is-enabled ${SERVICE_NAME}.service 2>/dev/null`).output === "enabled";
+	return systemctl("is-enabled").output === "enabled";
 }
 
 function getServiceStatus(): string {
 	return runShell(`systemctl --user status ${SERVICE_NAME}.service 2>&1`).output;
 }
 
+function disableService(): string[] {
+	const warnings: string[] = [];
+	const stop = systemctl("stop");
+	const disable = systemctl("disable");
+	runShell("systemctl --user daemon-reload");
+	if (!stop.ok) warnings.push(`  ⚠️  stop: ${stop.output}`);
+	if (!disable.ok) warnings.push(`  ⚠️  disable: ${disable.output}`);
+	return warnings;
+}
+
 // --- Composite operations ---
 
 function stopWatchdog(session: string): void {
 	if (isServiceInstalled()) {
-		runShell(`systemctl --user stop ${SERVICE_NAME}.service`);
+		systemctl("stop");
 	}
 	killTmuxSession(session);
 }
 
 function startWatchdog(session: string): { ok: boolean; output: string } {
 	if (isServiceInstalled()) {
-		return runShell(`systemctl --user start ${SERVICE_NAME}.service`);
+		return systemctl("start");
 	}
 	return runShell(`tmux new-session -d -s ${shellEscape(session)} ${shellEscape(WRAPPER_SCRIPT_PATH)}`);
 }
 
 async function waitForSession(session: string): Promise<boolean> {
 	for (let i = 0; i < START_POLL_ATTEMPTS; i++) {
-		await new Promise((r) => setTimeout(r, START_POLL_INTERVAL_MS));
+		await delay(START_POLL_INTERVAL_MS);
 		if (isTmuxSessionRunning(session)) return true;
 	}
 	return false;
+}
+
+/** Start watchdog and wait for tmux session. Returns user-facing message. */
+async function startAndWait(session: string): Promise<{ ok: boolean; message: string }> {
+	const { ok, output } = startWatchdog(session);
+	if (!ok) {
+		return { ok: false, message: `❌ Failed to start: ${output}` };
+	}
+
+	if (await waitForSession(session)) {
+		return { ok: true, message: `🐕 pi-watchdog started in tmux session '${session}'.\n  Attach with: ${attachHint(session)}` };
+	}
+	return { ok: false, message: "❌ tmux session did not start. Check /watchdog-logs" };
 }
 
 async function isWrapperExecutable(): Promise<boolean> {
@@ -225,6 +257,17 @@ async function isWrapperExecutable(): Promise<boolean> {
 	} catch {
 		return false;
 	}
+}
+
+/** Validate preconditions for starting the watchdog. Returns error message or null. */
+async function validateStartPreconditions(config: WatchdogConfig): Promise<string | null> {
+	if (!isTmuxInstalled()) return "❌ tmux is not installed.";
+	if (!config.enabled) return "❌ Watchdog not enabled. Run /watchdog-enable first.";
+	if (!(await isWrapperExecutable())) return "❌ Wrapper script missing. Run /watchdog-enable to regenerate.";
+	if (isTmuxSessionRunning(config.tmuxSession)) {
+		return `⚠️  tmux session '${config.tmuxSession}' is already running (another pi instance may be active).\n  Attach with: ${attachHint(config.tmuxSession)}`;
+	}
+	return null;
 }
 
 async function regenerateServiceFiles(config: WatchdogConfig): Promise<string> {
@@ -364,17 +407,14 @@ WantedBy=default.target
 // --- Extension entry point ---
 
 export default function (pi: ExtensionAPI) {
-	pi.on("session_start", async (event, _ctx) => {
+	pi.on("session_start", async (event) => {
 		if (event.reason !== "startup") return;
 
 		const config = await readConfig();
 		if (!config.enabled || !config.autoTelegram) return;
+		if (!(await readTelegramConfig())) return;
 
-		const tgConfig = await readTelegramConfig();
-		if (!tgConfig) return;
-
-		const now = new Date().toISOString();
-		await sendTelegramNotification(`🐕 pi-watchdog: pi started at ${now}`);
+		await sendTelegramNotification(`🐕 pi-watchdog: pi started at ${new Date().toISOString()}`);
 
 		setTimeout(() => {
 			pi.sendUserMessage("/telegram-connect", { deliverAs: "followUp" });
@@ -387,36 +427,32 @@ export default function (pi: ExtensionAPI) {
 		description: "Show pi-watchdog status",
 		handler: async (_args, ctx) => {
 			const config = await readConfig();
-			const tmuxInstalled = isTmuxInstalled();
+			const tmuxOk = isTmuxInstalled();
 			const session = config.tmuxSession;
-			const tmuxRunning = tmuxInstalled && isTmuxSessionRunning(session);
+			const tmuxRunning = tmuxOk && isTmuxSessionRunning(session);
 			const svcInstalled = isServiceInstalled();
-			const svcEnabled = svcInstalled && isServiceEnabled();
-			const svcRunning = svcInstalled && isServiceRunning();
-			const hasTg = (await readTelegramConfig()) !== null;
-			const wrapperOk = await isWrapperExecutable();
 
 			const lines = [
 				"🐕 pi-watchdog status:",
 				"",
 				"  Config:",
-				`    enabled:         ${config.enabled ? "✅" : "❌"}`,
-				`    auto-telegram:   ${config.autoTelegram ? "✅" : "❌"}`,
+				`    enabled:         ${check(config.enabled)}`,
+				`    auto-telegram:   ${check(config.autoTelegram)}`,
 				`    restart delay:   ${config.restartDelaySec}s`,
 				`    tmux session:    ${session}`,
 				`    extra pi args:   ${config.piArgs.length > 0 ? config.piArgs.join(" ") : "(none)"}`,
 				"",
 				"  Runtime:",
-				`    tmux installed:  ${tmuxInstalled ? "✅" : "❌ (required)"}`,
-				`    tmux session:    ${tmuxRunning ? "✅ running" : "❌ not running"}`,
-				`    systemd svc:     ${svcInstalled ? (svcEnabled ? "✅ enabled" : "⚠️  installed but disabled") : "❌ not installed"}`,
-				`    systemd active:  ${svcRunning ? "✅" : "❌"}`,
-				`    wrapper script:  ${wrapperOk ? "✅" : "❌ missing"}`,
-				`    telegram config: ${hasTg ? "✅ found" : "❌ not found"}`,
+				`    tmux installed:  ${check(tmuxOk, "✅", "❌ (required)")}`,
+				`    tmux session:    ${check(tmuxRunning, "✅ running", "❌ not running")}`,
+				`    systemd svc:     ${svcInstalled ? check(isServiceEnabled(), "✅ enabled", "⚠️  installed but disabled") : "❌ not installed"}`,
+				`    systemd active:  ${check(svcInstalled && isServiceRunning())}`,
+				`    wrapper script:  ${check(await isWrapperExecutable(), "✅", "❌ missing")}`,
+				`    telegram config: ${check((await readTelegramConfig()) !== null, "✅ found", "❌ not found")}`,
 			];
 
 			if (tmuxRunning) {
-				lines.push("", `  Attach with: tmux attach -t ${session}`);
+				lines.push("", `  Attach with: ${attachHint(session)}`);
 			}
 
 			if (svcInstalled) {
@@ -441,12 +477,11 @@ export default function (pi: ExtensionAPI) {
 			const config = await readConfig();
 
 			if (config.enabled && isServiceInstalled()) {
-				const ok = await ctx.ui.confirm("Already enabled", "Watchdog is already enabled. Regenerate files?");
-				if (!ok) return;
+				if (!(await ctx.ui.confirm("Already enabled", "Watchdog is already enabled. Regenerate files?"))) return;
 			}
 
 			try {
-				getPiBinary(); // validate before generating anything
+				getPiBinary();
 			} catch (e: any) {
 				ctx.ui.notify(`❌ ${e.message}`, "error");
 				return;
@@ -470,14 +505,14 @@ export default function (pi: ExtensionAPI) {
 						`  Service file:   ${servicePath}`,
 						`  tmux session:   ${session}`,
 						"  Lingering:      enabled",
-						"  Auto-start:     ✅ on boot",
-						"  Auto-restart:   ✅ on crash (respawn loop with backoff)",
-						`  Auto-telegram:  ${config.autoTelegram ? "✅" : "❌"}`,
+						`  Auto-start:     ${check(true)} on boot`,
+						`  Auto-restart:   ${check(true)} on crash (respawn loop with backoff)`,
+						`  Auto-telegram:  ${check(config.autoTelegram)}`,
 						"",
 						"  The service is NOT started yet (you're running pi interactively).",
 						"  On next reboot it will start automatically.",
 						"  Or use /watchdog-start to start it now.",
-						`  Attach with: tmux attach -t ${session}`,
+						`  Attach with: ${attachHint(session)}`,
 					].join("\n"),
 					"success"
 				);
@@ -494,13 +529,8 @@ export default function (pi: ExtensionAPI) {
 			const warnings: string[] = [];
 
 			if (isServiceInstalled()) {
-				const stop = runShell(`systemctl --user stop ${SERVICE_NAME}.service`);
-				const disable = runShell(`systemctl --user disable ${SERVICE_NAME}.service`);
-				runShell("systemctl --user daemon-reload");
-				if (!stop.ok) warnings.push(`  ⚠️  stop: ${stop.output}`);
-				if (!disable.ok) warnings.push(`  ⚠️  disable: ${disable.output}`);
+				warnings.push(...disableService());
 			}
-
 			killTmuxSession(config.tmuxSession);
 
 			config.enabled = false;
@@ -521,39 +551,14 @@ export default function (pi: ExtensionAPI) {
 		description: "Start the pi-watchdog tmux session now",
 		handler: async (_args, ctx) => {
 			const config = await readConfig();
-			const session = config.tmuxSession;
-
-			if (!isTmuxInstalled()) {
-				ctx.ui.notify("❌ tmux is not installed.", "error");
-				return;
-			}
-			if (!config.enabled) {
-				ctx.ui.notify("❌ Watchdog not enabled. Run /watchdog-enable first.", "error");
-				return;
-			}
-			if (!(await isWrapperExecutable())) {
-				ctx.ui.notify("❌ Wrapper script missing. Run /watchdog-enable to regenerate.", "error");
-				return;
-			}
-			if (isTmuxSessionRunning(session)) {
-				ctx.ui.notify(
-					`⚠️  tmux session '${session}' is already running (another pi instance may be active).\n  Attach with: tmux attach -t ${session}`,
-					"warning"
-				);
+			const error = await validateStartPreconditions(config);
+			if (error) {
+				ctx.ui.notify(error, error.startsWith("⚠️") ? "warning" : "error");
 				return;
 			}
 
-			const { ok, output } = startWatchdog(session);
-			if (!ok) {
-				ctx.ui.notify(`❌ Failed to start: ${output}`, "error");
-				return;
-			}
-
-			if (await waitForSession(session)) {
-				ctx.ui.notify(`🐕 pi-watchdog started in tmux session '${session}'.\n  Attach with: tmux attach -t ${session}`, "success");
-			} else {
-				ctx.ui.notify("❌ tmux session did not start. Check /watchdog-logs", "error");
-			}
+			const result = await startAndWait(config.tmuxSession);
+			ctx.ui.notify(result.message, result.ok ? "success" : "error");
 		},
 	});
 
@@ -564,32 +569,25 @@ export default function (pi: ExtensionAPI) {
 			const session = config.tmuxSession;
 
 			stopWatchdog(session);
-			await new Promise((r) => setTimeout(r, STOP_SETTLE_MS));
+			await delay(STOP_SETTLE_MS);
 
 			if (!isServiceInstalled() && !(await isWrapperExecutable())) {
 				ctx.ui.notify("❌ Not enabled or wrapper missing. Run /watchdog-enable first.", "error");
 				return;
 			}
 
-			const { ok, output } = startWatchdog(session);
-			if (!ok) {
-				ctx.ui.notify(`❌ Failed to restart: ${output}`, "error");
-				return;
-			}
-
-			if (await waitForSession(session)) {
-				ctx.ui.notify(`🐕 pi-watchdog restarted.\n  Attach with: tmux attach -t ${session}`, "success");
-			} else {
-				ctx.ui.notify("❌ Restart failed. Check /watchdog-logs", "error");
-			}
+			const result = await startAndWait(session);
+			ctx.ui.notify(
+				result.ok ? `🐕 pi-watchdog restarted.\n  Attach with: ${attachHint(session)}` : result.message,
+				result.ok ? "success" : "error"
+			);
 		},
 	});
 
 	pi.registerCommand("watchdog-stop", {
 		description: "Stop the pi-watchdog tmux session",
 		handler: async (_args, ctx) => {
-			const config = await readConfig();
-			stopWatchdog(config.tmuxSession);
+			stopWatchdog((await readConfig()).tmuxSession);
 			ctx.ui.notify("🐕 pi-watchdog stopped.", "info");
 		},
 	});
