@@ -118,7 +118,7 @@ async function sendTelegramNotification(message: string): Promise<boolean> {
 
 // --- Formatting helpers ---
 
-function check(val: boolean, trueText = "✅", falseText = "❌"): string {
+function statusIcon(val: boolean, trueText = "✅", falseText = "❌"): string {
 	return val ? trueText : falseText;
 }
 
@@ -264,17 +264,17 @@ async function waitForSession(session: string): Promise<boolean> {
 	return false;
 }
 
-/** Start watchdog and wait for tmux session. Returns user-facing message. */
-async function startAndWait(session: string): Promise<{ ok: boolean; message: string }> {
-	const { ok, output } = startWatchdog(session);
-	if (!ok) {
-		return { ok: false, message: `❌ Failed to start: ${output}` };
+/** Start watchdog and wait for tmux session. Returns { ok, output } with user-facing message. */
+async function startAndWait(session: string): Promise<{ ok: boolean; output: string }> {
+	const result = startWatchdog(session);
+	if (!result.ok) {
+		return { ok: false, output: `❌ Failed to start: ${result.output}` };
 	}
 
 	if (await waitForSession(session)) {
-		return { ok: true, message: `🐕 pi-watchdog started in tmux session '${session}'.\n  Attach with: ${attachHint(session)}` };
+		return { ok: true, output: `🐕 pi-watchdog started in tmux session '${session}'.\n  Attach with: ${attachHint(session)}` };
 	}
-	return { ok: false, message: "❌ tmux session did not start. Check /watchdog-logs" };
+	return { ok: false, output: "❌ tmux session did not start. Check /watchdog-logs" };
 }
 
 async function isWrapperExecutable(): Promise<boolean> {
@@ -345,18 +345,8 @@ notify_telegram() {
 }`;
 }
 
-function generateWrapperScript(config: WatchdogConfig): string {
-	const shimPath = getMiseShimPath();
-	const nodeDir = join(homedir(), ".local", "share", "mise", "installs", "node", "latest", "bin");
-	const piCmd = join(shimPath, "pi");
-	const home = homedir();
-
-	const baseArgs = config.piArgs.includes("-c") ? [] : ["-c"];
-	const piArgs = [...baseArgs, ...config.piArgs].map(shellEscape).join(" ");
-
-	// Build the bash script via string concatenation to avoid jiti parse errors.
-	// jiti chokes on bash syntax like ${#ARR[@]} and \${VAR} inside template literals.
-	const lines: string[] = [
+function generateWrapperPreamble(shimPath: string, nodeDir: string, home: string): string[] {
+	return [
 		"#!/usr/bin/env bash",
 		"# pi-watchdog respawn loop \u2014 runs inside tmux",
 		"# Auto-generated. Do not edit; re-run /watchdog-enable to regenerate.",
@@ -370,21 +360,11 @@ function generateWrapperScript(config: WatchdogConfig): string {
 		'cd "' + home + '"',
 		"",
 		generateTelegramCurlNotify(),
-		"",
-		"declare -a CRASH_TIMES=()",
-		"",
-		"while true; do",
-		'    echo "[pi-watchdog] Starting pi at $(date -u +%Y-%m-%dT%H:%M:%SZ) ..."',
-		"    " + piCmd + " " + piArgs,
-		"    EXIT_CODE=$?",
-		"    NOW=$(date +%s)",
-		'    echo "[pi-watchdog] pi exited with code $EXIT_CODE at $(date -u +%Y-%m-%dT%H:%M:%SZ)"',
-		"",
-		"    if [ $EXIT_CODE -ne 0 ]; then",
-		'        notify_telegram "\u26a0\ufe0f pi-watchdog: pi crashed with exit code $EXIT_CODE at $(date -u +%Y-%m-%dT%H:%M:%SZ)"',
-		'        CRASH_TIMES+=("$NOW")',
-		"    fi",
-		"",
+	];
+}
+
+function generateCrashTrackingBlock(): string[] {
+	return [
 		"    # Prune crash timestamps older than the window",
 		"    PRUNED=()",
 		'    if [ ${#CRASH_TIMES[@]} -gt 0 ]; then',
@@ -404,15 +384,43 @@ function generateWrapperScript(config: WatchdogConfig): string {
 		'        notify_telegram "\ud83d\uded1 pi-watchdog: ' + MAX_RAPID_CRASHES + " rapid crashes detected, backing off for " + RAPID_CRASH_BACKOFF_SEC + 's"',
 		"        sleep " + RAPID_CRASH_BACKOFF_SEC,
 		"        CRASH_TIMES=()",
+	];
+}
+
+function generateWrapperScript(config: WatchdogConfig): string {
+	const shimPath = getMiseShimPath();
+	const nodeDir = join(homedir(), ".local", "share", "mise", "installs", "node", "latest", "bin");
+	const piCmd = join(shimPath, "pi");
+	const home = homedir();
+
+	const baseArgs = config.piArgs.includes("-c") ? [] : ["-c"];
+	const piArgs = [...baseArgs, ...config.piArgs].map(shellEscape).join(" ");
+
+	return [
+		...generateWrapperPreamble(shimPath, nodeDir, home),
+		"",
+		"declare -a CRASH_TIMES=()",
+		"",
+		"while true; do",
+		'    echo "[pi-watchdog] Starting pi at $(date -u +%Y-%m-%dT%H:%M:%SZ) ..."',
+		"    " + piCmd + " " + piArgs,
+		"    EXIT_CODE=$?",
+		"    NOW=$(date +%s)",
+		'    echo "[pi-watchdog] pi exited with code $EXIT_CODE at $(date -u +%Y-%m-%dT%H:%M:%SZ)"',
+		"",
+		"    if [ $EXIT_CODE -ne 0 ]; then",
+		'        notify_telegram "\u26a0\ufe0f pi-watchdog: pi crashed with exit code $EXIT_CODE at $(date -u +%Y-%m-%dT%H:%M:%SZ)"',
+		'        CRASH_TIMES+=("$NOW")',
+		"    fi",
+		"",
+		...generateCrashTrackingBlock(),
 		"    else",
 		'        echo "[pi-watchdog] Restarting in ' + config.restartDelaySec + 's ..."',
 		"        sleep " + config.restartDelaySec,
 		"    fi",
 		"done",
 		"",
-	];
-
-	return lines.join("\n");
+	].join("\n");
 }
 
 /** Escape a value for use in a systemd unit file (double-quote context). */
@@ -443,6 +451,24 @@ function generateServiceUnit(config: WatchdogConfig): string {
 		"WantedBy=default.target",
 		"",
 	].join("\n");
+}
+
+interface EnableResult {
+	servicePath: string;
+	adopted: { adopted: boolean; oldName?: string };
+	linger: { ok: boolean; output: string };
+}
+
+async function enableWatchdog(config: WatchdogConfig): Promise<EnableResult> {
+	config.enabled = true;
+	const adopted = adoptCurrentTmuxSession(config.tmuxSession);
+
+	await writeConfig(config);
+	const servicePath = await regenerateServiceFiles(config);
+	const linger = runShell("loginctl enable-linger");
+	runShell(`systemctl --user enable ${SERVICE_NAME}.service`);
+
+	return { servicePath, adopted, linger };
 }
 
 // --- Instance detection ---
@@ -526,19 +552,19 @@ export default function (pi: ExtensionAPI) {
 				"🐕 pi-watchdog status:",
 				"",
 				"  Config:",
-				`    enabled:         ${check(config.enabled)}`,
-				`    auto-telegram:   ${check(config.autoTelegram)}`,
+				`    enabled:         ${statusIcon(config.enabled)}`,
+				`    auto-telegram:   ${statusIcon(config.autoTelegram)}`,
 				`    restart delay:   ${config.restartDelaySec}s`,
 				`    tmux session:    ${session}`,
 				`    extra pi args:   ${config.piArgs.length > 0 ? config.piArgs.join(" ") : "(none)"}`,
 				"",
 				"  Runtime:",
-				`    tmux installed:  ${check(tmuxOk, "✅", "❌ (required)")}`,
-				`    tmux session:    ${check(tmuxRunning, "✅ running", "❌ not running")}`,
-				`    systemd svc:     ${svcInstalled ? check(isServiceEnabled(), "✅ enabled", "⚠️  installed but disabled") : "❌ not installed"}`,
-				`    systemd active:  ${check(svcInstalled && isServiceRunning())}`,
-				`    wrapper script:  ${check(await isWrapperExecutable(), "✅", "❌ missing")}`,
-				`    telegram config: ${check((await readTelegramConfig()) !== null, "✅ found", "❌ not found")}`,
+				`    tmux installed:  ${statusIcon(tmuxOk, "✅", "❌ (required)")}`,
+				`    tmux session:    ${statusIcon(tmuxRunning, "✅ running", "❌ not running")}`,
+				`    systemd svc:     ${svcInstalled ? statusIcon(isServiceEnabled(), "✅ enabled", "⚠️  installed but disabled") : "❌ not installed"}`,
+				`    systemd active:  ${statusIcon(svcInstalled && isServiceRunning())}`,
+				`    wrapper script:  ${statusIcon(await isWrapperExecutable(), "✅", "❌ missing")}`,
+				`    telegram config: ${statusIcon((await readTelegramConfig()) !== null, "✅ found", "❌ not found")}`,
 			];
 
 			if (tmuxRunning) {
@@ -572,29 +598,22 @@ export default function (pi: ExtensionAPI) {
 
 			config.enabled = true;
 
-			// If we're inside a tmux session with a different name, rename it
-			const adopt = adoptCurrentTmuxSession(config.tmuxSession);
-
 			try {
-				await writeConfig(config);
-				const servicePath = await regenerateServiceFiles(config);
-
-				const linger = runShell("loginctl enable-linger");
-				runShell(`systemctl --user enable ${SERVICE_NAME}.service`);
+				const { servicePath, adopted, linger } = await enableWatchdog(config);
 
 				const session = config.tmuxSession;
 				ctx.ui.notify(
 					[
 						"🐕 pi-watchdog enabled!",
 						"",
-						...(adopt.adopted ? [`  Renamed tmux session '${adopt.oldName}' \u2192 '${session}'`] : []),
+						...(adopted.adopted ? [`  Renamed tmux session '${adopted.oldName}' \u2192 '${session}'`] : []),
 						`  Wrapper script: ${WRAPPER_SCRIPT_PATH}`,
 						`  Service file:   ${servicePath}`,
 						`  tmux session:   ${session}`,
 						`  Lingering:      ${linger.ok ? "enabled" : "⚠️  failed (" + linger.output + ")"}`,
-						`  Auto-start:     ${check(true)} on boot`,
-						`  Auto-restart:   ${check(true)} on crash (respawn loop with backoff)`,
-						`  Auto-telegram:  ${check(config.autoTelegram)}`,
+						`  Auto-start:     ${statusIcon(true)} on boot`,
+						`  Auto-restart:   ${statusIcon(true)} on crash (respawn loop with backoff)`,
+						`  Auto-telegram:  ${statusIcon(config.autoTelegram)}`,
 						"",
 						"  The service is NOT started yet (you're running pi interactively).",
 						"  On next reboot it will start automatically.",
@@ -645,7 +664,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const result = await startAndWait(config.tmuxSession);
-			ctx.ui.notify(result.message, result.ok ? "success" : "error");
+			ctx.ui.notify(result.output, result.ok ? "success" : "error");
 		},
 	});
 
@@ -665,7 +684,7 @@ export default function (pi: ExtensionAPI) {
 
 			const result = await startAndWait(session);
 			ctx.ui.notify(
-				result.ok ? `🐕 pi-watchdog restarted.\n  Attach with: ${attachHint(session)}` : result.message,
+				result.ok ? `🐕 pi-watchdog restarted.\n  Attach with: ${attachHint(session)}` : result.output,
 				result.ok ? "success" : "error"
 			);
 		},
