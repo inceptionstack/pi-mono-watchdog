@@ -55,10 +55,21 @@ interface TelegramConfig {
 
 // --- Config I/O ---
 
+function validateConfig(raw: Record<string, unknown>): Partial<WatchdogConfig> {
+	const valid: Partial<WatchdogConfig> = {};
+	if (typeof raw.enabled === "boolean") valid.enabled = raw.enabled;
+	if (typeof raw.autoTelegram === "boolean") valid.autoTelegram = raw.autoTelegram;
+	if (typeof raw.restartDelaySec === "number" && raw.restartDelaySec >= 1) valid.restartDelaySec = raw.restartDelaySec;
+	if (typeof raw.tmuxSession === "string" && /^[a-zA-Z0-9_.-]+$/.test(raw.tmuxSession)) valid.tmuxSession = raw.tmuxSession;
+	if (Array.isArray(raw.piArgs) && raw.piArgs.every((a: unknown) => typeof a === "string")) valid.piArgs = raw.piArgs as string[];
+	return valid;
+}
+
 async function readConfig(): Promise<WatchdogConfig> {
 	try {
 		const content = await readFile(WATCHDOG_CONFIG_PATH, "utf8");
-		return { ...DEFAULT_CONFIG, ...JSON.parse(content) };
+		const raw = JSON.parse(content);
+		return { ...DEFAULT_CONFIG, ...validateConfig(raw) };
 	} catch {
 		return { ...DEFAULT_CONFIG };
 	}
@@ -322,86 +333,100 @@ function generateWrapperScript(config: WatchdogConfig): string {
 	const shimPath = getMiseShimPath();
 	const nodeDir = join(homedir(), ".local", "share", "mise", "installs", "node", "latest", "bin");
 	const piCmd = join(shimPath, "pi");
+	const home = homedir();
 
 	const baseArgs = config.piArgs.includes("-c") ? [] : ["-c"];
 	const piArgs = [...baseArgs, ...config.piArgs].map(shellEscape).join(" ");
 
-	return `#!/usr/bin/env bash
-# pi-watchdog respawn loop — runs inside tmux
-# Auto-generated. Do not edit; re-run /watchdog-enable to regenerate.
+	// Build the bash script via string concatenation to avoid jiti parse errors.
+	// jiti chokes on bash syntax like ${#ARR[@]} and \${VAR} inside template literals.
+	const lines: string[] = [
+		"#!/usr/bin/env bash",
+		"# pi-watchdog respawn loop \u2014 runs inside tmux",
+		"# Auto-generated. Do not edit; re-run /watchdog-enable to regenerate.",
+		"",
+		"set -u",
+		"",
+		'export PATH="' + shimPath + ":" + nodeDir + ':${PATH}"',
+		'export HOME="' + home + '"',
+		"export NODE_NO_WARNINGS=1",
+		"",
+		'cd "' + home + '"',
+		"",
+		generateTelegramCurlNotify(),
+		"",
+		"declare -a CRASH_TIMES=()",
+		"",
+		"while true; do",
+		'    echo "[pi-watchdog] Starting pi at $(date -u +%Y-%m-%dT%H:%M:%SZ) ..."',
+		"    " + piCmd + " " + piArgs,
+		"    EXIT_CODE=$?",
+		"    NOW=$(date +%s)",
+		'    echo "[pi-watchdog] pi exited with code $EXIT_CODE at $(date -u +%Y-%m-%dT%H:%M:%SZ)"',
+		"",
+		"    if [ $EXIT_CODE -ne 0 ]; then",
+		'        notify_telegram "\u26a0\ufe0f pi-watchdog: pi crashed with exit code $EXIT_CODE at $(date -u +%Y-%m-%dT%H:%M:%SZ)"',
+		'        CRASH_TIMES+=("$NOW")',
+		"    fi",
+		"",
+		"    # Prune crash timestamps older than the window",
+		"    PRUNED=()",
+		"    if (( ${#CRASH_TIMES[@]} > 0 )); then",
+		'        for T in "${CRASH_TIMES[@]}"; do',
+		"            if (( NOW - T < " + RAPID_CRASH_WINDOW_SEC + " )); then",
+		'                PRUNED+=("$T")',
+		"            fi",
+		"        done",
+		"    fi",
+		"    CRASH_TIMES=()",
+		"    if (( ${#PRUNED[@]} > 0 )); then",
+		'        CRASH_TIMES=("${PRUNED[@]}")',
+		"    fi",
+		"",
+		"    if (( ${#CRASH_TIMES[@]} >= " + MAX_RAPID_CRASHES + " )); then",
+		'        echo "[pi-watchdog] Detected ${#CRASH_TIMES[@]} crashes in ' + RAPID_CRASH_WINDOW_SEC + "s \u2014 backing off for " + RAPID_CRASH_BACKOFF_SEC + 's"',
+		'        notify_telegram "\ud83d\uded1 pi-watchdog: ' + MAX_RAPID_CRASHES + " rapid crashes detected, backing off for " + RAPID_CRASH_BACKOFF_SEC + 's"',
+		"        sleep " + RAPID_CRASH_BACKOFF_SEC,
+		"        CRASH_TIMES=()",
+		"    else",
+		'        echo "[pi-watchdog] Restarting in ' + config.restartDelaySec + 's ..."',
+		"        sleep " + config.restartDelaySec,
+		"    fi",
+		"done",
+		"",
+	];
 
-set -u
+	return lines.join("\n");
+}
 
-export PATH="${shimPath}:${nodeDir}:\${PATH}"
-export HOME="${homedir()}"
-export NODE_NO_WARNINGS=1
-
-cd "${homedir()}"
-
-${generateTelegramCurlNotify()}
-
-declare -a CRASH_TIMES=()
-
-while true; do
-    echo "[pi-watchdog] Starting pi at $(date -u +%Y-%m-%dT%H:%M:%SZ) ..."
-    ${piCmd} ${piArgs}
-    EXIT_CODE=$?
-    NOW=$(date +%s)
-    echo "[pi-watchdog] pi exited with code $EXIT_CODE at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-    if [ $EXIT_CODE -ne 0 ]; then
-        notify_telegram "⚠️ pi-watchdog: pi crashed with exit code $EXIT_CODE at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        CRASH_TIMES+=("$NOW")
-    fi
-
-    # Prune crash timestamps older than the window
-    PRUNED=()
-    if (( \\${#CRASH_TIMES[@]} > 0 )); then
-        for T in "\\${CRASH_TIMES[@]}"; do
-            if (( NOW - T < ${RAPID_CRASH_WINDOW_SEC} )); then
-                PRUNED+=("$T")
-            fi
-        done
-    fi
-    CRASH_TIMES=()
-    if (( \\${#PRUNED[@]} > 0 )); then
-        CRASH_TIMES=("\\${PRUNED[@]}")
-    fi
-
-    if (( \\${#CRASH_TIMES[@]} >= ${MAX_RAPID_CRASHES} )); then
-        echo "[pi-watchdog] Detected \\${#CRASH_TIMES[@]} crashes in ${RAPID_CRASH_WINDOW_SEC}s — backing off for ${RAPID_CRASH_BACKOFF_SEC}s"
-        notify_telegram "🛑 pi-watchdog: ${MAX_RAPID_CRASHES} rapid crashes detected, backing off for ${RAPID_CRASH_BACKOFF_SEC}s"
-        sleep ${RAPID_CRASH_BACKOFF_SEC}
-        CRASH_TIMES=()
-    else
-        echo "[pi-watchdog] Restarting in ${config.restartDelaySec}s ..."
-        sleep ${config.restartDelaySec}
-    fi
-done
-`;
+/** Escape a value for use in a systemd unit file (double-quote context). */
+function systemdEscape(val: string): string {
+	return val.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 function generateServiceUnit(config: WatchdogConfig): string {
 	const tmuxBinary = getTmuxBinary();
-	const session = shellEscape(config.tmuxSession);
+	const session = config.tmuxSession;
 
-	return `[Unit]
-Description=pi coding agent (tmux watchdog)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-Environment="HOME=${homedir()}"
-ExecStart=${tmuxBinary} new-session -d -s ${session} ${shellEscape(WRAPPER_SCRIPT_PATH)}
-ExecStop=${tmuxBinary} kill-session -t ${session}
-RemainAfterExit=yes
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=default.target
-`;
+	return [
+		"[Unit]",
+		"Description=pi coding agent (tmux watchdog)",
+		"After=network-online.target",
+		"Wants=network-online.target",
+		"",
+		"[Service]",
+		"Type=oneshot",
+		'Environment="HOME=' + systemdEscape(homedir()) + '"',
+		"ExecStart=" + tmuxBinary + " new-session -d -s " + session + " " + WRAPPER_SCRIPT_PATH,
+		"ExecStop=" + tmuxBinary + " kill-session -t " + session,
+		"RemainAfterExit=yes",
+		"StandardOutput=journal",
+		"StandardError=journal",
+		"",
+		"[Install]",
+		"WantedBy=default.target",
+		"",
+	].join("\n");
 }
 
 // --- Instance detection ---
@@ -528,7 +553,7 @@ export default function (pi: ExtensionAPI) {
 				await writeConfig(config);
 				const servicePath = await regenerateServiceFiles(config);
 
-				runShell("loginctl enable-linger");
+				const linger = runShell("loginctl enable-linger");
 				runShell(`systemctl --user enable ${SERVICE_NAME}.service`);
 
 				const session = config.tmuxSession;
@@ -539,7 +564,7 @@ export default function (pi: ExtensionAPI) {
 						`  Wrapper script: ${WRAPPER_SCRIPT_PATH}`,
 						`  Service file:   ${servicePath}`,
 						`  tmux session:   ${session}`,
-						"  Lingering:      enabled",
+						`  Lingering:      ${linger.ok ? "enabled" : "⚠️  failed (" + linger.output + ")"}`,
 						`  Auto-start:     ${check(true)} on boot`,
 						`  Auto-restart:   ${check(true)} on crash (respawn loop with backoff)`,
 						`  Auto-telegram:  ${check(config.autoTelegram)}`,
