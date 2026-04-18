@@ -4,6 +4,9 @@
 # Works on Ubuntu/Debian and Amazon Linux/RHEL (x86_64 + arm64).
 set -euo pipefail
 
+# Disable GPG verification for mise node install (fails in non-interactive sessions)
+export MISE_NODE_VERIFY=0
+
 # --- Configuration (edit these) ---
 
 # Provider mode: "api-key" or "bedrock-iam" or "bedrock-key"
@@ -28,7 +31,7 @@ AWS_REGION_VAL_KEY="us-east-1"      # AWS region for Bedrock
 # Common options:
 TELEGRAM_BOT_TOKEN=""                # optional: your Telegram bot token
 TELEGRAM_USER_ID=""                  # optional: your Telegram user ID (numeric)
-PI_MODEL="bedrock/us.anthropic.claude-opus-4-6-v1"  # optional: e.g., "anthropic/claude-sonnet-4-20250514"
+PI_MODEL="amazon-bedrock/us.anthropic.claude-opus-4-6-v1"  # optional: e.g., "anthropic/claude-sonnet-4-20250514"
 # ----------------------------------
 
 # --- Validate ---
@@ -62,7 +65,8 @@ echo "[setup] Installing system dependencies..."
 if command -v apt-get >/dev/null 2>&1; then
     sudo apt-get update -qq && sudo apt-get install -y -qq tmux curl git jq >/dev/null
 elif command -v yum >/dev/null 2>&1; then
-    sudo yum install -y -q tmux curl git jq >/dev/null
+    sudo yum install -y -q tmux git jq >/dev/null
+    command -v curl >/dev/null || sudo yum install -y -q curl >/dev/null || true
 else
     echo "[setup] Unsupported package manager. Install tmux, curl, git, jq manually." >&2
 fi
@@ -194,6 +198,7 @@ mkdir -p ~/.pi/agent/extensions/pi-watchdog
 cat > ~/.pi/agent/extensions/pi-watchdog/pi-loop.sh << WRAPPER
 #!/usr/bin/env bash
 set -u
+export PATH="\$HOME/.local/share/mise/shims:\$HOME/.local/bin:\$PATH"
 export NODE_NO_WARNINGS=1
 cd "\$HOME"
 while true; do
@@ -247,6 +252,15 @@ echo "[setup] Enabling systemd service..."
 sudo loginctl enable-linger "$(whoami)"
 systemctl --user daemon-reload
 systemctl --user enable pi-agent.service
+systemctl --user start pi-agent.service
+
+# Wait briefly and verify
+sleep 3
+if tmux has-session -t pi 2>/dev/null; then
+    TMUX_STATUS="running ✅"
+else
+    TMUX_STATUS="not running ❌"
+fi
 
 echo ""
 echo "=== Setup complete ==="
@@ -254,7 +268,8 @@ echo "  Provider:      $PROVIDER_MODE"
 echo "  pi agent is configured with watchdog."
 echo "  It will start automatically on next boot."
 echo ""
-echo "  To start now:  systemctl --user start pi-agent"
+echo "  Service:       enabled and started"
+echo "  tmux session:  $TMUX_STATUS"
 echo "  To attach:     tmux attach -t pi"
 echo "  To check:      systemctl --user status pi-agent"
 [ -n "$TELEGRAM_BOT_TOKEN" ] && echo "  Telegram:      configured ✅"
