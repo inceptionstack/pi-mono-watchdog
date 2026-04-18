@@ -126,9 +126,16 @@ install_runtime() {
 
     ensure_cmd mise install_mise
 
-    ensure_cmd node log "Installing Node.js via mise..." && mise use -g node@lts
+    if ! command -v node >/dev/null 2>&1; then
+        log "Installing Node.js via mise..."
+        mise use -g node@lts
+    fi
 
-    ensure_cmd pi log "Installing pi..." && npm install -g @mariozechner/pi-coding-agent && hash -r
+    if ! command -v pi >/dev/null 2>&1; then
+        log "Installing pi..."
+        npm install -g @mariozechner/pi-coding-agent
+        hash -r
+    fi
 }
 
 # --- Configure provider ---
