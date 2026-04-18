@@ -10,7 +10,7 @@ set -euo pipefail
 #   api-key      — standard API key (Anthropic, Google, OpenAI, etc.)
 #   bedrock-iam  — AWS Bedrock via IAM role (EC2 instance profile, no keys needed)
 #   bedrock-key  — AWS Bedrock via access key + secret key
-PROVIDER_MODE="api-key"
+PROVIDER_MODE="bedrock-iam"
 
 # For api-key mode:
 API_KEY=""                           # your API key
@@ -28,7 +28,7 @@ AWS_REGION_VAL_KEY="us-east-1"      # AWS region for Bedrock
 # Common options:
 TELEGRAM_BOT_TOKEN=""                # optional: your Telegram bot token
 TELEGRAM_USER_ID=""                  # optional: your Telegram user ID (numeric)
-PI_MODEL=""                          # optional: e.g., "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0"
+PI_MODEL="bedrock/us.anthropic.claude-opus-4-6-v1"  # optional: e.g., "anthropic/claude-sonnet-4-20250514"
 # ----------------------------------
 
 # --- Validate ---
@@ -71,7 +71,8 @@ fi
 if ! command -v mise >/dev/null 2>&1; then
     echo "[setup] Installing mise..."
     curl -fsSL https://mise.run | sh
-    echo 'eval "$(~/.local/bin/mise activate bash)"' >> ~/.bashrc
+    grep -q 'mise activate bash' ~/.bashrc 2>/dev/null || \
+        echo 'eval "$(~/.local/bin/mise activate bash)"' >> ~/.bashrc
 fi
 
 # Ensure mise shims are on PATH for this script
@@ -85,6 +86,7 @@ fi
 if ! command -v pi >/dev/null 2>&1; then
     echo "[setup] Installing pi..."
     npm install -g @mariozechner/pi-coding-agent
+    hash -r
 fi
 
 # --- Configure provider environment ---
@@ -97,11 +99,13 @@ ENV_CONF="$HOME/.config/environment.d/pi.conf"
 
 write_env() {
     local key="$1" val="$2"
-    echo "${key}=${val}" >> "$ENV_CONF"
+    echo "${key}=\"${val}\"" >> "$ENV_CONF"
     export "${key}=${val}"
-    # Also add to .bashrc for interactive sessions (idempotent)
-    sed -i "/^export ${key}=/d" ~/.bashrc 2>/dev/null || true
-    echo "export ${key}=\"${val}\"" >> ~/.bashrc
+    # Add to .bashrc for interactive sessions (idempotent) — skip secrets
+    if [[ "$key" != *SECRET* && "$key" != *KEY* && "$key" != *TOKEN* ]]; then
+        sed -i "/^export ${key}=/d" ~/.bashrc 2>/dev/null || true
+        echo "export ${key}=\"${val}\"" >> ~/.bashrc
+    fi
 }
 
 case "$PROVIDER_MODE" in
@@ -141,14 +145,14 @@ pi install git:github.com/inceptionstack/pi-mono-watchdog 2>/dev/null || true
 if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_USER_ID" ]; then
     echo "[setup] Configuring Telegram..."
     mkdir -p ~/.pi/agent
-    cat > ~/.pi/agent/telegram.json << EOF
-{
-    "botToken": "${TELEGRAM_BOT_TOKEN}",
-    "allowedUserId": ${TELEGRAM_USER_ID}
-}
-EOF
+    jq -n --arg token "$TELEGRAM_BOT_TOKEN" --argjson uid "$TELEGRAM_USER_ID" \
+        '{botToken: $token, allowedUserId: $uid}' > ~/.pi/agent/telegram.json
     chmod 600 ~/.pi/agent/telegram.json
 fi
+
+# Lock down pi agent directory
+mkdir -p ~/.pi/agent
+chmod 700 ~/.pi/agent
 
 # Pre-configure watchdog as enabled
 echo "[setup] Configuring watchdog..."
@@ -173,23 +177,30 @@ cat > ~/.pi/agent/watchdog.json << EOF
 }
 EOF
 
-# Generate a minimal bootstrap wrapper script.
+# Generate a minimal bootstrap wrapper script that passes piArgs.
 # On first run, the watchdog extension regenerates this with full crash
 # tracking, backoff, and Telegram notifications — no manual intervention needed.
 # The loop intentionally restarts on ALL exits (including clean exit 0)
 # because the watchdog manages lifecycle. Use /watchdog-stop or kill the
 # tmux session to stop pi.
+
+# Build the pi command with args for the bootstrap wrapper
+PI_CMD="pi -c"
+if [ ${#PI_EXTRA_ARGS[@]} -gt 0 ]; then
+    PI_CMD="pi -c $(printf '%q ' "${PI_EXTRA_ARGS[@]}")"
+fi
+
 mkdir -p ~/.pi/agent/extensions/pi-watchdog
-cat > ~/.pi/agent/extensions/pi-watchdog/pi-loop.sh << 'WRAPPER'
+cat > ~/.pi/agent/extensions/pi-watchdog/pi-loop.sh << WRAPPER
 #!/usr/bin/env bash
 set -u
 export NODE_NO_WARNINGS=1
-cd "$HOME"
+cd "\$HOME"
 while true; do
-    echo "[pi-watchdog] Starting pi at $(date -u +%Y-%m-%dT%H:%M:%SZ) ..."
-    pi -c
-    EXIT_CODE=$?
-    echo "[pi-watchdog] pi exited with code $EXIT_CODE at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "[pi-watchdog] Starting pi at \$(date -u +%Y-%m-%dT%H:%M:%SZ) ..."
+    ${PI_CMD}
+    EXIT_CODE=\$?
+    echo "[pi-watchdog] pi exited with code \$EXIT_CODE at \$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "[pi-watchdog] Restarting in 5s ..."
     sleep 5
 done
