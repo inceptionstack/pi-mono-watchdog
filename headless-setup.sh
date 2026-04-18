@@ -153,7 +153,7 @@ configure_provider() {
         bedrock-iam)
             write_env "AWS_DEFAULT_REGION" "$AWS_REGION_VAL"
             write_env "AWS_REGION" "$AWS_REGION_VAL"
-            [ -n "$AWS_PROFILE_VAL" ] && write_env "AWS_PROFILE" "$AWS_PROFILE_VAL"
+            write_env "AWS_PROFILE" "${AWS_PROFILE_VAL:-default}"
             ensure_dir ~/.aws
             if [ ! -f ~/.aws/config ]; then
                 cat > ~/.aws/config << AWSCFG
