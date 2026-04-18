@@ -178,7 +178,7 @@ AWSCFG
 
 install_extensions() {
     log "Installing pi extensions..."
-    pi install git:github.com/badlogic/pi-telegram 2>/dev/null || true
+    pi install git:github.com/inceptionstack/pi-telegram 2>/dev/null || true
     pi install git:github.com/inceptionstack/pi-mono-watchdog 2>/dev/null || true
 }
 
