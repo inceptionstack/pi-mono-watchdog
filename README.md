@@ -106,8 +106,14 @@ To deploy a pi agent with watchdog pre-enabled on a fresh VM (EC2, GCP, etc.) wi
 ### Prerequisites
 
 You'll need:
-- An **API key** for your LLM provider (e.g., `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`)
 - Optionally, a **Telegram bot token** and your **Telegram user ID** (from [@userinfobot](https://t.me/userinfobot))
+- One of the following provider configurations:
+
+| Mode | Config vars | Use case |
+|------|------------|----------|
+| `api-key` | `API_KEY`, `API_KEY_VAR` | Anthropic, Google, OpenAI direct API |
+| `bedrock-iam` | `AWS_REGION_VAL`, optionally `AWS_PROFILE_VAL` | EC2 with IAM role / instance profile (no keys needed) |
+| `bedrock-key` | `AWS_ACCESS_KEY_ID_VAL`, `AWS_SECRET_ACCESS_KEY_VAL`, `AWS_REGION_VAL_KEY` | AWS Bedrock with static access keys |
 
 ### Setup script
 

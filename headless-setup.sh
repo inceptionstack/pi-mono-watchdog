@@ -5,18 +5,58 @@
 set -euo pipefail
 
 # --- Configuration (edit these) ---
-API_KEY="your-api-key-here"          # e.g., Anthropic, Google, or OpenAI key
-API_KEY_VAR="ANTHROPIC_API_KEY"      # env var name: ANTHROPIC_API_KEY, GOOGLE_API_KEY, OPENAI_API_KEY
+
+# Provider mode: "api-key" or "bedrock-iam" or "bedrock-key"
+#   api-key      — standard API key (Anthropic, Google, OpenAI, etc.)
+#   bedrock-iam  — AWS Bedrock via IAM role (EC2 instance profile, no keys needed)
+#   bedrock-key  — AWS Bedrock via access key + secret key
+PROVIDER_MODE="api-key"
+
+# For api-key mode:
+API_KEY=""                           # your API key
+API_KEY_VAR="ANTHROPIC_API_KEY"      # env var: ANTHROPIC_API_KEY, GOOGLE_API_KEY, OPENAI_API_KEY
+
+# For bedrock-iam mode:
+AWS_REGION_VAL="us-east-1"           # AWS region for Bedrock
+AWS_PROFILE_VAL=""                   # optional: AWS profile name (leave empty for default)
+
+# For bedrock-key mode:
+AWS_ACCESS_KEY_ID_VAL=""             # AWS access key
+AWS_SECRET_ACCESS_KEY_VAL=""         # AWS secret key
+AWS_REGION_VAL_KEY="us-east-1"      # AWS region for Bedrock
+
+# Common options:
 TELEGRAM_BOT_TOKEN=""                # optional: your Telegram bot token
 TELEGRAM_USER_ID=""                  # optional: your Telegram user ID (numeric)
-PI_MODEL=""                          # optional: e.g., "anthropic/claude-sonnet-4-20250514"
+PI_MODEL=""                          # optional: e.g., "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0"
 # ----------------------------------
 
 # --- Validate ---
-if [[ "$API_KEY" == "your-api-key-here" || -z "$API_KEY" ]]; then
-    echo "ERROR: Set API_KEY in this script before running." >&2
-    exit 1
-fi
+case "$PROVIDER_MODE" in
+    api-key)
+        if [[ -z "$API_KEY" ]]; then
+            echo "ERROR: Set API_KEY for api-key mode." >&2
+            exit 1
+        fi
+        ;;
+    bedrock-iam)
+        # No keys needed — uses instance profile / IAM role
+        if [[ -z "$AWS_REGION_VAL" ]]; then
+            echo "ERROR: Set AWS_REGION_VAL for bedrock-iam mode." >&2
+            exit 1
+        fi
+        ;;
+    bedrock-key)
+        if [[ -z "$AWS_ACCESS_KEY_ID_VAL" || -z "$AWS_SECRET_ACCESS_KEY_VAL" ]]; then
+            echo "ERROR: Set AWS_ACCESS_KEY_ID_VAL and AWS_SECRET_ACCESS_KEY_VAL for bedrock-key mode." >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "ERROR: PROVIDER_MODE must be api-key, bedrock-iam, or bedrock-key." >&2
+        exit 1
+        ;;
+esac
 
 echo "[setup] Installing system dependencies..."
 if command -v apt-get >/dev/null 2>&1; then
@@ -47,20 +87,50 @@ if ! command -v pi >/dev/null 2>&1; then
     npm install -g @mariozechner/pi-coding-agent
 fi
 
-# Set up API key via environment.d (picked up by systemd user services)
-echo "[setup] Configuring API key..."
+# --- Configure provider environment ---
+echo "[setup] Configuring provider ($PROVIDER_MODE)..."
 mkdir -p ~/.config/environment.d
 ENV_CONF="$HOME/.config/environment.d/pi.conf"
-# Idempotent: remove old entry, write fresh
-grep -v "^${API_KEY_VAR}=" "$ENV_CONF" > "${ENV_CONF}.tmp" 2>/dev/null || true
-echo "${API_KEY_VAR}=${API_KEY}" >> "${ENV_CONF}.tmp"
-mv "${ENV_CONF}.tmp" "$ENV_CONF"
-chmod 600 "$ENV_CONF"
-export "${API_KEY_VAR}=${API_KEY}"
 
-# Also add to .bashrc for interactive sessions (idempotent)
-grep -q "^export ${API_KEY_VAR}=" ~/.bashrc 2>/dev/null || \
-    echo "export ${API_KEY_VAR}=\"${API_KEY}\"" >> ~/.bashrc
+# Start fresh (idempotent)
+: > "$ENV_CONF"
+
+write_env() {
+    local key="$1" val="$2"
+    echo "${key}=${val}" >> "$ENV_CONF"
+    export "${key}=${val}"
+    # Also add to .bashrc for interactive sessions (idempotent)
+    sed -i "/^export ${key}=/d" ~/.bashrc 2>/dev/null || true
+    echo "export ${key}=\"${val}\"" >> ~/.bashrc
+}
+
+case "$PROVIDER_MODE" in
+    api-key)
+        write_env "$API_KEY_VAR" "$API_KEY"
+        ;;
+    bedrock-iam)
+        write_env "AWS_DEFAULT_REGION" "$AWS_REGION_VAL"
+        write_env "AWS_REGION" "$AWS_REGION_VAL"
+        [ -n "$AWS_PROFILE_VAL" ] && write_env "AWS_PROFILE" "$AWS_PROFILE_VAL"
+        # Ensure AWS CLI config exists for the region
+        mkdir -p ~/.aws
+        if [ ! -f ~/.aws/config ]; then
+            cat > ~/.aws/config << AWSCFG
+[default]
+region = ${AWS_REGION_VAL}
+output = json
+AWSCFG
+        fi
+        ;;
+    bedrock-key)
+        write_env "AWS_ACCESS_KEY_ID" "$AWS_ACCESS_KEY_ID_VAL"
+        write_env "AWS_SECRET_ACCESS_KEY" "$AWS_SECRET_ACCESS_KEY_VAL"
+        write_env "AWS_DEFAULT_REGION" "${AWS_REGION_VAL_KEY}"
+        write_env "AWS_REGION" "${AWS_REGION_VAL_KEY}"
+        ;;
+esac
+
+chmod 600 "$ENV_CONF"
 
 # Install pi extensions (idempotent — pi install skips if already present)
 echo "[setup] Installing pi extensions..."
@@ -169,6 +239,7 @@ systemctl --user enable pi-agent.service
 
 echo ""
 echo "=== Setup complete ==="
+echo "  Provider:      $PROVIDER_MODE"
 echo "  pi agent is configured with watchdog."
 echo "  It will start automatically on next boot."
 echo ""
