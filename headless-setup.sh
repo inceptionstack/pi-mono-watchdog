@@ -68,14 +68,14 @@ bashrc_add() {
 ensure_dir() {
     local dir="$1" mode="${2:-}"
     mkdir -p "$dir"
-    [ -n "$mode" ] && chmod "$mode" "$dir"
+    if [ -n "$mode" ]; then chmod "$mode" "$dir"; fi
 }
 
 # Write content to a file with given permissions.
 write_file() {
     local path="$1" mode="${2:-}"
     cat > "$path"
-    [ -n "$mode" ] && chmod "$mode" "$path"
+    if [ -n "$mode" ]; then chmod "$mode" "$path"; fi
 }
 
 # --- Validate ---
